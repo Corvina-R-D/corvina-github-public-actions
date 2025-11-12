@@ -1,0 +1,24 @@
+name: Mirror public repository
+description: Mirrors a git public repository
+
+inputs:
+  source:
+    description: The source repository to mirror
+    default: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
+  target:
+    description: The target repository to push the mirror to
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Mirror repository
+      shell: bash
+      env:
+        source: ${{ inputs.source }}
+        target: ${{ inputs.target }}
+      run: |
+        git clone --mirror "$source" mirror.git
+        cd mirror.git
+        git remote set-url origin "$target"
+        git push --mirror --prune
