@@ -1,0 +1,206 @@
+name: Publish npm package
+
+# Called on `release: published`: publishes each package at the release tag version via npm
+# trusted publishing, then bumps `version-files` on the default branch. The npm trusted
+# publisher must name the caller's workflow file.
+# Release tag: `X.Y.Z` or `vX.Y.Z`, optionally `-<pre>.N` for prereleases, which get a
+# dist-tag (`2.0.0-beta.1` -> beta, `2.0.0-0` -> next), never `latest`.
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node.js version used to install, test and build
+        type: string
+        default: "24"
+      test-script:
+        description: npm script run before building; empty to skip
+        type: string
+        default: test
+      build-script:
+        description: npm script that builds the package
+        type: string
+        default: build
+      # Lists: block scalar, one `- item` per line (inputs can't be YAML sequences).
+      publish-dirs:
+        description: Directories, after the build, each holding a package to publish
+        type: string
+        default: "- ."
+      version-files:
+        description: Manifests whose `version` is bumped on the default branch
+        type: string
+        default: "- package.json"
+      default-branch:
+        description: Branch where the released version is recorded
+        type: string
+        default: main
+
+jobs:
+  publish:
+    name: Build and publish on npm
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+    steps:
+      # Release tag: `X.Y.Z` or `vX.Y.Z`, optionally `-<pre>.N` for prereleases, which get a
+      # dist-tag (`2.0.0-beta.1` -> beta, `2.0.0-0` -> next), never `latest`.
+      - name: Resolve version from release tag
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Release tag '$RELEASE_TAG' is not a semver version (expected e.g. 1.2.9)"
+            exit 1
+          fi
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          if [[ "$VERSION" == *-* ]]; then
+            PRERELEASE="${VERSION#*-}"
+            DIST_TAG="${PRERELEASE%%.*}"
+            [[ "$DIST_TAG" =~ ^[0-9]+$ ]] && DIST_TAG=next
+            if ! [[ "$DIST_TAG" =~ ^[A-Za-z][0-9A-Za-z-]*$ ]] || [[ "$DIST_TAG" =~ ^([xX]|[vV][0-9].*|latest)$ ]]; then
+              echo "::error::Release tag '$RELEASE_TAG' would publish under dist-tag '$DIST_TAG', which npm refuses or which would move 'latest' (expected e.g. 2.0.0-beta.1)"
+              exit 1
+            fi
+            echo "npm_config_tag=${DIST_TAG}" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      # Trusted publishing needs npm >= 11.5.1.
+      - name: Update npm
+        run: npm install -g npm@^11.5.1
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        if: inputs.test-script != ''
+        env:
+          SCRIPT: ${{ inputs.test-script }}
+        run: npm run "${SCRIPT}"
+
+      - name: Build
+        env:
+          SCRIPT: ${{ inputs.build-script }}
+        run: npm run "${SCRIPT}"
+
+      # OIDC auth, no token. Already published versions are skipped so re-runs succeed.
+      - name: Publish on npm
+        env:
+          PUBLISH_DIRS: ${{ inputs.publish-dirs }}
+        run: |
+          mapfile -t dirs < <(sed -nE 's/^\s*(-\s+)?(\S.*\S|\S)\s*$/\2/p' <<< "${PUBLISH_DIRS}")
+          for dir in "${dirs[@]}"; do
+            (
+              cd "${dir}"
+              PACKAGE="$(node -p "require('./package.json').name")"
+              if [ -n "$(npm view "${PACKAGE}@${VERSION}" version 2>/dev/null)" ]; then
+                echo "::notice::${PACKAGE}@${VERSION} is already published, skipping"
+                exit 0
+              fi
+              npm version "${VERSION}" --no-git-tag-version --allow-same-version
+              npm publish --access public
+              echo "Published [${PACKAGE}@${VERSION}](https://www.npmjs.com/package/${PACKAGE}/v/${VERSION})" >> "${GITHUB_STEP_SUMMARY}"
+            )
+          done
+
+  # Separate job: a failure here doesn't affect the published package and can be re-run alone.
+  sync-version:
+    name: Record the released version
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+      DEFAULT_BRANCH: ${{ inputs.default-branch }}
+      VERSION_FILES: ${{ inputs.version-files }}
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.default-branch }}
+
+      # Only moves forward: skips prereleases and versions not newer than the first file's.
+      - name: Decide whether the version needs the bump
+        id: bump
+        run: |
+          mapfile -t files < <(sed -nE 's/^\s*(-\s+)?(\S.*\S|\S)\s*$/\2/p' <<< "${VERSION_FILES}")
+          VERSION="${RELEASE_TAG#v}"
+          CURRENT="$(node -p 'require(process.argv[1]).version' "./${files[0]}")"
+          PACKAGE="$(node -p 'process.argv.slice(1).map((f) => require(f).name).join(", ")' "${files[@]/#/./}")"
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "PACKAGE=${PACKAGE}" >> "${GITHUB_ENV}"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "::notice::${VERSION} is a prerelease, leaving ${DEFAULT_BRANCH} at ${CURRENT}"
+          elif node -e '
+            const core = (v) => v.split("-")[0].split(".").map(Number);
+            const [release, current] = process.argv.slice(1);
+            const [r, c] = [core(release), core(current)];
+            for (let i = 0; i < 3; i++) if (r[i] !== c[i]) process.exit(r[i] > c[i] ? 0 : 1);
+            process.exit(current.includes("-") ? 0 : 1);
+          ' "$VERSION" "$CURRENT"; then
+            echo "needed=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "::notice::${DEFAULT_BRANCH} is already at ${CURRENT}, not moving it to ${VERSION}"
+          fi
+
+      # Org rulesets require a PR and an `ECC-` branch prefix.
+      - name: Commit version bump
+        if: steps.bump.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BUMP_BRANCH="ECC-publish-bump-${VERSION}"
+          gh pr list --state open --head "${BUMP_BRANCH}" --json number --jq '.[0].number' \
+            | xargs -r -I{} gh pr close {} --delete-branch
+          git push origin --delete "${BUMP_BRANCH}" 2>/dev/null || true
+
+          # `npm version` also updates the lockfile; other manifests keep their formatting.
+          mapfile -t files < <(sed -nE 's/^\s*(-\s+)?(\S.*\S|\S)\s*$/\2/p' <<< "${VERSION_FILES}")
+          for file in "${files[@]}"; do
+            if [ "$(basename "${file}")" = package.json ]; then
+              (cd "$(dirname "${file}")" && npm version "${VERSION}" --no-git-tag-version --allow-same-version)
+            else
+              node -e '
+                const fs = require("fs");
+                const [file, version] = process.argv.slice(1);
+                const text = fs.readFileSync(file, "utf8")
+                  .replace(/("version"\s*:\s*")[^"]*"/, `$1${version}"`);
+                if (JSON.parse(text).version !== version) throw new Error(`no top-level version in ${file}`);
+                fs.writeFileSync(file, text);
+              ' "${file}" "${VERSION}"
+            fi
+          done
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "${BUMP_BRANCH}"
+          git add -u
+          git commit -m "chore: bump ${PACKAGE} to ${VERSION}"
+          git push origin "${BUMP_BRANCH}"
+          echo "BUMP_BRANCH=${BUMP_BRANCH}" >> "${GITHUB_ENV}"
+
+      - name: Open and merge version bump PR
+        if: steps.bump.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_URL="$(gh pr create \
+            --base "${DEFAULT_BRANCH}" \
+            --head "${BUMP_BRANCH}" \
+            --title "chore: bump ${PACKAGE} to ${VERSION}" \
+            --body "Automated version bump after publishing release ${RELEASE_TAG}.")"
+          gh pr merge "${PR_URL}" --squash --delete-branch \
+            --subject "chore: bump ${PACKAGE} to ${VERSION} [skip ci]"
