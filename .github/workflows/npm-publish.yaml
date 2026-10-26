@@ -4,35 +4,86 @@ name: Publish npm package
 # trusted publishing, then bumps `version-files` on the default branch. The npm trusted
 # publisher must name the caller's workflow file.
 # Release tag: `X.Y.Z` or `vX.Y.Z`, optionally `-<pre>.N` for prereleases, which get a
-# dist-tag (`2.0.0-beta.1` -> beta, `2.0.0-0` -> next), never `latest`.
+# dist-tag (`2.0.0-beta.1` -> beta, `2.0.0-0` -> next), never `latest`; preceded by
+# `tag-prefix`, if set.
 on:
   workflow_call:
     inputs:
+      working-directory:
+        description: Directory holding the root package.json; the paths below are relative to it
+        type: string
+        default: "."
       node-version:
         description: Node.js version used to install, test and build
         type: string
-        default: "24"
+        default: "22"
+      package-manager:
+        description: "`npm` (`npm ci`, if package-lock.json exists) or `yarn` (Berry, via Corepack)"
+        type: string
+        default: npm
+      go-version-file:
+        description: go.mod path from the repo root, to set up Go for the build; empty for none
+        type: string
+        default: ""
       test-script:
-        description: npm script run before building; empty to skip
+        description: Script run before building; empty to skip
         type: string
         default: test
       build-script:
-        description: npm script that builds the package
+        description: Script that builds the packages
         type: string
         default: build
       # Lists: block scalar, one `- item` per line (inputs can't be YAML sequences).
       publish-dirs:
-        description: Directories, after the build, each holding a package to publish
+        description: Directories, after the build, each holding a package to publish, in order
         type: string
         default: "- ."
       version-files:
-        description: Manifests whose `version` is bumped on the default branch
+        description: Manifests set to the released version; the first one is the reference
         type: string
         default: "- package.json"
       default-branch:
         description: Branch where the released version is recorded
         type: string
         default: main
+      tag-prefix:
+        description: Prefix of the release tag before the version, e.g. `my-lib-` for `my-lib-v1.2.3`, to release packages of one repo separately
+        type: string
+        default: ""
+
+env:
+  RELEASE_TAG: ${{ github.event.release.tag_name }}
+  TAG_PREFIX: ${{ inputs.tag-prefix }}
+  PM: ${{ inputs.package-manager }}
+  LIST_SED: 's/^\s*(-\s+)?(\S.*\S|\S)\s*$/\2/p'
+  # Sets `version` in the given manifests, keeping their formatting, plus any sibling
+  # package-lock.json and the dependency ranges between the listed packages.
+  SET_VERSION_JS: |
+    const fs = require("fs");
+    const path = require("path");
+    const [version, ...manifests] = process.argv.slice(1);
+    const files = manifests.flatMap((f) => {
+      const lock = path.join(path.dirname(f), "package-lock.json");
+      return path.basename(f) === "package.json" && fs.existsSync(lock) ? [f, lock] : [f];
+    });
+    const names = manifests.map((f) => JSON.parse(fs.readFileSync(f, "utf8")).name).filter(Boolean);
+    const escape = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+    for (const file of files) {
+      let text = fs.readFileSync(file, "utf8");
+      if (path.basename(file) === "package-lock.json") {
+        const lock = JSON.parse(text);
+        lock.version = version;
+        if (lock.packages?.[""]) lock.packages[""].version = version;
+        text = JSON.stringify(lock, null, 2) + "\n";
+      } else {
+        text = text.replace(/("version"\s*:\s*")[^"]*"/, `$1${version}"`);
+        for (const name of names) {
+          text = text.replace(new RegExp(`("${escape(name)}"\\s*:\\s*"[~^]?)\\d[^"]*"`, "g"), `$1${version}"`);
+        }
+      }
+      if (JSON.parse(text).version !== version) throw new Error(`no top-level version in ${file}`);
+      fs.writeFileSync(file, text);
+    }
 
 jobs:
   publish:
@@ -41,19 +92,26 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    env:
-      RELEASE_TAG: ${{ github.event.release.tag_name }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
     steps:
       # Release tag: `X.Y.Z` or `vX.Y.Z`, optionally `-<pre>.N` for prereleases, which get a
       # dist-tag (`2.0.0-beta.1` -> beta, `2.0.0-0` -> next), never `latest`.
       - name: Resolve version from release tag
+        id: version
+        working-directory: .
         run: |
-          VERSION="${RELEASE_TAG#v}"
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Release tag '$RELEASE_TAG' is not a semver version (expected e.g. 1.2.9)"
+          VERSION="${RELEASE_TAG#"${TAG_PREFIX}"}"
+          VERSION="${VERSION#v}"
+          if [[ "$RELEASE_TAG" != "${TAG_PREFIX}"* ]] || ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Release tag '$RELEASE_TAG' is not a semver version (expected e.g. ${TAG_PREFIX}1.2.9)"
             exit 1
           fi
           echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           if [[ "$VERSION" == *-* ]]; then
             PRERELEASE="${VERSION#*-}"
             DIST_TAG="${PRERELEASE%%.*}"
@@ -62,7 +120,7 @@ jobs:
               echo "::error::Release tag '$RELEASE_TAG' would publish under dist-tag '$DIST_TAG', which npm refuses or which would move 'latest' (expected e.g. 2.0.0-beta.1)"
               exit 1
             fi
-            echo "npm_config_tag=${DIST_TAG}" >> "${GITHUB_ENV}"
+            echo "DIST_TAG=${DIST_TAG}" >> "${GITHUB_ENV}"
           fi
 
       - name: Checkout release tag
@@ -77,40 +135,74 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
+      - name: Setup Go
+        if: inputs.go-version-file != ''
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: ${{ inputs.go-version-file }}
+          cache: false
+
       # Trusted publishing needs npm >= 11.5.1.
       - name: Update npm
+        if: inputs.package-manager == 'npm'
         run: npm install -g npm@^11.5.1
 
+      - name: Enable Corepack
+        if: inputs.package-manager == 'yarn'
+        run: corepack enable
+
       - name: Install dependencies
-        run: npm ci
+        run: |
+          if [ "${PM}" = yarn ]; then
+            yarn install --immutable
+          elif [ -f package-lock.json ]; then
+            npm ci
+          fi
+
+      # Before the build, so build steps reading the version see the released one.
+      - name: Set version from release tag
+        env:
+          VERSION_FILES: ${{ inputs.version-files }}
+        run: |
+          mapfile -t files < <(sed -nE "${LIST_SED}" <<< "${VERSION_FILES}")
+          node -e "${SET_VERSION_JS}" "${VERSION}" "${files[@]}"
 
       - name: Test
         if: inputs.test-script != ''
         env:
           SCRIPT: ${{ inputs.test-script }}
-        run: npm run "${SCRIPT}"
+        run: ${PM} run "${SCRIPT}"
 
       - name: Build
         env:
           SCRIPT: ${{ inputs.build-script }}
-        run: npm run "${SCRIPT}"
+        run: ${PM} run "${SCRIPT}"
 
       # OIDC auth, no token. Already published versions are skipped so re-runs succeed.
+      # Yarn, unlike npm, adds provenance only when asked.
       - name: Publish on npm
         env:
           PUBLISH_DIRS: ${{ inputs.publish-dirs }}
+          PROVENANCE: ${{ !github.event.repository.private && '--provenance' || '' }}
         run: |
-          mapfile -t dirs < <(sed -nE 's/^\s*(-\s+)?(\S.*\S|\S)\s*$/\2/p' <<< "${PUBLISH_DIRS}")
+          mapfile -t dirs < <(sed -nE "${LIST_SED}" <<< "${PUBLISH_DIRS}")
           for dir in "${dirs[@]}"; do
             (
               cd "${dir}"
               PACKAGE="$(node -p "require('./package.json').name")"
+              if [ "$(node -p "require('./package.json').version")" != "${VERSION}" ]; then
+                echo "::error::${dir}/package.json is not at ${VERSION}: add its source to version-files"
+                exit 1
+              fi
               if [ -n "$(npm view "${PACKAGE}@${VERSION}" version 2>/dev/null)" ]; then
                 echo "::notice::${PACKAGE}@${VERSION} is already published, skipping"
                 exit 0
               fi
-              npm version "${VERSION}" --no-git-tag-version --allow-same-version
-              npm publish --access public
+              if [ "${PM}" = yarn ]; then
+                yarn npm publish --access public ${DIST_TAG:+--tag "${DIST_TAG}"} ${PROVENANCE}
+              else
+                npm publish --access public ${DIST_TAG:+--tag "${DIST_TAG}"}
+              fi
               echo "Published [${PACKAGE}@${VERSION}](https://www.npmjs.com/package/${PACKAGE}/v/${VERSION})" >> "${GITHUB_STEP_SUMMARY}"
             )
           done
@@ -123,25 +215,32 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
     env:
-      RELEASE_TAG: ${{ github.event.release.tag_name }}
       DEFAULT_BRANCH: ${{ inputs.default-branch }}
       VERSION_FILES: ${{ inputs.version-files }}
+      VERSION: ${{ needs.publish.outputs.version }}
     steps:
       - name: Checkout default branch
         uses: actions/checkout@v7
         with:
           ref: ${{ inputs.default-branch }}
 
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager-cache: false
+
       # Only moves forward: skips prereleases and versions not newer than the first file's.
       - name: Decide whether the version needs the bump
         id: bump
         run: |
-          mapfile -t files < <(sed -nE 's/^\s*(-\s+)?(\S.*\S|\S)\s*$/\2/p' <<< "${VERSION_FILES}")
-          VERSION="${RELEASE_TAG#v}"
-          CURRENT="$(node -p 'require(process.argv[1]).version' "./${files[0]}")"
-          PACKAGE="$(node -p 'process.argv.slice(1).map((f) => require(f).name).join(", ")' "${files[@]/#/./}")"
-          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          mapfile -t files < <(sed -nE "${LIST_SED}" <<< "${VERSION_FILES}")
+          CURRENT="$(node -p 'require(require("path").resolve(process.argv[1])).version' "${files[0]}")"
+          PACKAGE="$(node -p 'process.argv.slice(1).map((f) => require(require("path").resolve(f)).name).filter(Boolean).join(", ")' "${files[@]}")"
           echo "PACKAGE=${PACKAGE}" >> "${GITHUB_ENV}"
           if [[ "$VERSION" == *-* ]]; then
             echo "::notice::${VERSION} is a prerelease, leaving ${DEFAULT_BRANCH} at ${CURRENT}"
@@ -157,33 +256,28 @@ jobs:
             echo "::notice::${DEFAULT_BRANCH} is already at ${CURRENT}, not moving it to ${VERSION}"
           fi
 
+      # yarn.lock records the dependency ranges between the packages, which may have changed.
+      - name: Set version
+        if: steps.bump.outputs.needed == 'true'
+        run: |
+          mapfile -t files < <(sed -nE "${LIST_SED}" <<< "${VERSION_FILES}")
+          node -e "${SET_VERSION_JS}" "${VERSION}" "${files[@]}"
+          if [ "${PM}" = yarn ]; then
+            corepack enable
+            yarn install --mode=update-lockfile
+          fi
+
       # Org rulesets require a PR and an `ECC-` branch prefix.
       - name: Commit version bump
         if: steps.bump.outputs.needed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          BUMP_BRANCH="ECC-publish-bump-${VERSION}"
+          BUMP_BRANCH="ECC-publish-bump-${TAG_PREFIX}${VERSION}"
           gh pr list --state open --head "${BUMP_BRANCH}" --json number --jq '.[0].number' \
             | xargs -r -I{} gh pr close {} --delete-branch
           git push origin --delete "${BUMP_BRANCH}" 2>/dev/null || true
 
-          # `npm version` also updates the lockfile; other manifests keep their formatting.
-          mapfile -t files < <(sed -nE 's/^\s*(-\s+)?(\S.*\S|\S)\s*$/\2/p' <<< "${VERSION_FILES}")
-          for file in "${files[@]}"; do
-            if [ "$(basename "${file}")" = package.json ]; then
-              (cd "$(dirname "${file}")" && npm version "${VERSION}" --no-git-tag-version --allow-same-version)
-            else
-              node -e '
-                const fs = require("fs");
-                const [file, version] = process.argv.slice(1);
-                const text = fs.readFileSync(file, "utf8")
-                  .replace(/("version"\s*:\s*")[^"]*"/, `$1${version}"`);
-                if (JSON.parse(text).version !== version) throw new Error(`no top-level version in ${file}`);
-                fs.writeFileSync(file, text);
-              ' "${file}" "${VERSION}"
-            fi
-          done
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "${BUMP_BRANCH}"
@@ -192,15 +286,23 @@ jobs:
           git push origin "${BUMP_BRANCH}"
           echo "BUMP_BRANCH=${BUMP_BRANCH}" >> "${GITHUB_ENV}"
 
+      # Doesn't fail where Actions can't open PRs or approvals are required: the bump is left
+      # for a maintainer to open or merge.
       - name: Open and merge version bump PR
         if: steps.bump.outputs.needed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          PR_URL="$(gh pr create \
+          if ! PR_URL="$(gh pr create \
             --base "${DEFAULT_BRANCH}" \
             --head "${BUMP_BRANCH}" \
             --title "chore: bump ${PACKAGE} to ${VERSION}" \
-            --body "Automated version bump after publishing release ${RELEASE_TAG}.")"
-          gh pr merge "${PR_URL}" --squash --delete-branch \
-            --subject "chore: bump ${PACKAGE} to ${VERSION} [skip ci]"
+            --body "Automated version bump after publishing release ${RELEASE_TAG}.")"; then
+            COMPARE_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${DEFAULT_BRANCH}...${BUMP_BRANCH}?expand=1"
+            echo "::warning::Could not open the version bump PR, open it from ${COMPARE_URL}"
+            echo "Version bump to open and merge: [${BUMP_BRANCH}](${COMPARE_URL})" >> "${GITHUB_STEP_SUMMARY}"
+          elif ! gh pr merge "${PR_URL}" --squash --delete-branch \
+            --subject "chore: bump ${PACKAGE} to ${VERSION} [skip ci]"; then
+            echo "::warning::Could not merge the version bump PR, it needs approval: ${PR_URL}"
+            echo "Version bump PR to approve and merge: ${PR_URL}" >> "${GITHUB_STEP_SUMMARY}"
+          fi
