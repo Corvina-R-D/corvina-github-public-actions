@@ -15,7 +15,7 @@ on:
       node-version:
         description: Node.js version used to install, test and build
         type: string
-        default: "24"
+        default: "22"
       package-manager:
         description: "`npm` (`npm ci`, if package-lock.json exists) or `yarn` (Berry, via Corepack)"
         type: string
