@@ -286,15 +286,23 @@ jobs:
           git push origin "${BUMP_BRANCH}"
           echo "BUMP_BRANCH=${BUMP_BRANCH}" >> "${GITHUB_ENV}"
 
+      # Doesn't fail where Actions can't open PRs or approvals are required: the bump is left
+      # for a maintainer to open or merge.
       - name: Open and merge version bump PR
         if: steps.bump.outputs.needed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          PR_URL="$(gh pr create \
+          if ! PR_URL="$(gh pr create \
             --base "${DEFAULT_BRANCH}" \
             --head "${BUMP_BRANCH}" \
             --title "chore: bump ${PACKAGE} to ${VERSION}" \
-            --body "Automated version bump after publishing release ${RELEASE_TAG}.")"
-          gh pr merge "${PR_URL}" --squash --delete-branch \
-            --subject "chore: bump ${PACKAGE} to ${VERSION} [skip ci]"
+            --body "Automated version bump after publishing release ${RELEASE_TAG}.")"; then
+            COMPARE_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${DEFAULT_BRANCH}...${BUMP_BRANCH}?expand=1"
+            echo "::warning::Could not open the version bump PR, open it from ${COMPARE_URL}"
+            echo "Version bump to open and merge: [${BUMP_BRANCH}](${COMPARE_URL})" >> "${GITHUB_STEP_SUMMARY}"
+          elif ! gh pr merge "${PR_URL}" --squash --delete-branch \
+            --subject "chore: bump ${PACKAGE} to ${VERSION} [skip ci]"; then
+            echo "::warning::Could not merge the version bump PR, it needs approval: ${PR_URL}"
+            echo "Version bump PR to approve and merge: ${PR_URL}" >> "${GITHUB_STEP_SUMMARY}"
+          fi
