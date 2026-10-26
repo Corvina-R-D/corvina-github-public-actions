@@ -4,7 +4,8 @@ name: Publish npm package
 # trusted publishing, then bumps `version-files` on the default branch. The npm trusted
 # publisher must name the caller's workflow file.
 # Release tag: `X.Y.Z` or `vX.Y.Z`, optionally `-<pre>.N` for prereleases, which get a
-# dist-tag (`2.0.0-beta.1` -> beta, `2.0.0-0` -> next), never `latest`.
+# dist-tag (`2.0.0-beta.1` -> beta, `2.0.0-0` -> next), never `latest`; preceded by
+# `tag-prefix`, if set.
 on:
   workflow_call:
     inputs:
@@ -45,9 +46,14 @@ on:
         description: Branch where the released version is recorded
         type: string
         default: main
+      tag-prefix:
+        description: Prefix of the release tag before the version, e.g. `my-lib-` for `my-lib-v1.2.3`, to release packages of one repo separately
+        type: string
+        default: ""
 
 env:
   RELEASE_TAG: ${{ github.event.release.tag_name }}
+  TAG_PREFIX: ${{ inputs.tag-prefix }}
   PM: ${{ inputs.package-manager }}
   LIST_SED: 's/^\s*(-\s+)?(\S.*\S|\S)\s*$/\2/p'
   # Sets `version` in the given manifests, keeping their formatting, plus any sibling
@@ -86,6 +92,8 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
@@ -93,14 +101,17 @@ jobs:
       # Release tag: `X.Y.Z` or `vX.Y.Z`, optionally `-<pre>.N` for prereleases, which get a
       # dist-tag (`2.0.0-beta.1` -> beta, `2.0.0-0` -> next), never `latest`.
       - name: Resolve version from release tag
+        id: version
         working-directory: .
         run: |
-          VERSION="${RELEASE_TAG#v}"
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Release tag '$RELEASE_TAG' is not a semver version (expected e.g. 1.2.9)"
+          VERSION="${RELEASE_TAG#"${TAG_PREFIX}"}"
+          VERSION="${VERSION#v}"
+          if [[ "$RELEASE_TAG" != "${TAG_PREFIX}"* ]] || ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Release tag '$RELEASE_TAG' is not a semver version (expected e.g. ${TAG_PREFIX}1.2.9)"
             exit 1
           fi
           echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           if [[ "$VERSION" == *-* ]]; then
             PRERELEASE="${VERSION#*-}"
             DIST_TAG="${PRERELEASE%%.*}"
@@ -210,6 +221,7 @@ jobs:
     env:
       DEFAULT_BRANCH: ${{ inputs.default-branch }}
       VERSION_FILES: ${{ inputs.version-files }}
+      VERSION: ${{ needs.publish.outputs.version }}
     steps:
       - name: Checkout default branch
         uses: actions/checkout@v7
@@ -227,10 +239,8 @@ jobs:
         id: bump
         run: |
           mapfile -t files < <(sed -nE "${LIST_SED}" <<< "${VERSION_FILES}")
-          VERSION="${RELEASE_TAG#v}"
           CURRENT="$(node -p 'require(require("path").resolve(process.argv[1])).version' "${files[0]}")"
           PACKAGE="$(node -p 'process.argv.slice(1).map((f) => require(require("path").resolve(f)).name).filter(Boolean).join(", ")' "${files[@]}")"
-          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
           echo "PACKAGE=${PACKAGE}" >> "${GITHUB_ENV}"
           if [[ "$VERSION" == *-* ]]; then
             echo "::notice::${VERSION} is a prerelease, leaving ${DEFAULT_BRANCH} at ${CURRENT}"
@@ -263,7 +273,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          BUMP_BRANCH="ECC-publish-bump-${VERSION}"
+          BUMP_BRANCH="ECC-publish-bump-${TAG_PREFIX}${VERSION}"
           gh pr list --state open --head "${BUMP_BRANCH}" --json number --jq '.[0].number' \
             | xargs -r -I{} gh pr close {} --delete-branch
           git push origin --delete "${BUMP_BRANCH}" 2>/dev/null || true
