@@ -1,0 +1,188 @@
+# Package a Helm chart and push it to an OCI registry on Google Artifact Registry.
+#
+# The chart version is derived from the triggering `<tag-prefix>X.Y.Z` git tag, or from the chart `appVersion`
+# (`<tag-prefix>X.Y.Z`) when not triggered by a tag. Callers need `permissions: id-token: write` and the target
+# repository must grant `roles/artifactregistry.writer` to the calling GitHub repository.
+#
+# Example:
+#   jobs:
+#     publish-chart:
+#       uses: Corvina-R-D/corvina-github-public-actions/.github/workflows/publish-helm-chart.yaml@v5
+#       with:
+#         chart-path: helm-charts
+#         oci-repository: europe-docker.pkg.dev/corvina-app-stasher/charts
+#         gcp-project-id: corvina-app-stasher
+on:
+  workflow_call:
+    inputs:
+      chart-path:
+        description: Path to the chart directory (the one containing Chart.yaml)
+        required: true
+        type: string
+      oci-repository:
+        description: OCI repository to push to, without the `oci://` scheme and chart name (e.g. europe-docker.pkg.dev/<project>/charts); its host is the registry logged in to
+        required: true
+        type: string
+      # GCP
+      gcp-project-id:
+        required: false
+        type: string
+      gcp-workload-identity-provider:
+        description: Workload identity provider used to authenticate to Google Cloud
+        required: false
+        type: string
+        default: projects/5996410059/locations/global/workloadIdentityPools/external/providers/github
+      tag-prefix:
+        description: Prefix stripped from the git tag and from the chart appVersion to compute the chart version
+        required: false
+        type: string
+        default: chart-
+      chart-version:
+        description: Explicit chart version, overrides the one derived from the git tag or appVersion
+        required: false
+        type: string
+      app-version:
+        description: Explicit chart appVersion, defaults to the one in Chart.yaml
+        required: false
+        type: string
+      allow-overwrite:
+        description: Allow pushing a chart version that already exists in the registry
+        required: false
+        type: boolean
+        default: false
+      helm-version:
+        required: false
+        type: string
+        default: v3.17.3
+    outputs:
+      chart-ref:
+        description: Fully qualified reference of the pushed chart (oci://<repository>/<name>:<version>)
+        value: ${{ jobs.publish.outputs.chart-ref }}
+      digest:
+        description: Digest of the pushed chart
+        value: ${{ jobs.publish.outputs.digest }}
+
+name: Publish Helm chart
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Package and push Helm chart
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        # explicit shell enables pipefail
+        shell: bash
+    outputs:
+      chart-ref: ${{ steps.push.outputs.chart-ref }}
+      digest: ${{ steps.push.outputs.digest }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Login to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ inputs.gcp-project-id }}
+          workload_identity_provider: ${{ inputs.gcp-workload-identity-provider }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v3
+
+      # no helm registry login: helm reuses the docker credential helper
+      - name: Setup credential helper for Artifact Registry
+        env:
+          OCI_REPOSITORY: ${{ inputs.oci-repository }}
+        run: gcloud auth configure-docker "${OCI_REPOSITORY%%/*}" --quiet
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: ${{ inputs.helm-version }}
+
+      - name: Compute chart version
+        id: version
+        env:
+          CHART_PATH: ${{ inputs.chart-path }}
+          TAG_PREFIX: ${{ inputs.tag-prefix }}
+          INPUT_CHART_VERSION: ${{ inputs.chart-version }}
+          INPUT_APP_VERSION: ${{ inputs.app-version }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          name=$(yq '.name' "${CHART_PATH}/Chart.yaml")
+          chart_app_version=$(yq '.appVersion' "${CHART_PATH}/Chart.yaml")
+
+          if [ "${REF_TYPE}" = "tag" ] && [ "${REF_NAME}" != "${chart_app_version}" ]; then
+            echo "::error::Tag ${REF_NAME} does not match the appVersion ${chart_app_version} in ${CHART_PATH}/Chart.yaml"
+            exit 1
+          fi
+
+          app_version=${INPUT_APP_VERSION:-$chart_app_version}
+          version=${INPUT_CHART_VERSION:-${app_version#"$TAG_PREFIX"}}
+
+          if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Chart version '${version}' is not a valid semantic version"
+            exit 1
+          fi
+
+          echo "Publishing chart ${name} version ${version} (appVersion ${app_version})"
+          {
+            echo "name=${name}"
+            echo "version=${version}"
+            echo "app-version=${app_version}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check chart version is not already published
+        if: ${{ !inputs.allow-overwrite }}
+        env:
+          OCI_REPOSITORY: ${{ inputs.oci-repository }}
+          NAME: ${{ steps.version.outputs.name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if helm show chart "oci://${OCI_REPOSITORY}/${NAME}" --version "${VERSION}" > /dev/null 2>&1; then
+            echo "::error::Chart ${NAME} ${VERSION} already exists in ${OCI_REPOSITORY}"
+            exit 1
+          fi
+
+      - name: Package chart
+        env:
+          CHART_PATH: ${{ inputs.chart-path }}
+          VERSION: ${{ steps.version.outputs.version }}
+          APP_VERSION: ${{ steps.version.outputs.app-version }}
+        run: |
+          helm dependency build "${CHART_PATH}"
+          helm lint "${CHART_PATH}"
+          helm package "${CHART_PATH}" --version "${VERSION}" --app-version "${APP_VERSION}" --destination dist
+
+      - name: Push chart
+        id: push
+        env:
+          OCI_REPOSITORY: ${{ inputs.oci-repository }}
+          NAME: ${{ steps.version.outputs.name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          helm push "dist/${NAME}-${VERSION}.tgz" "oci://${OCI_REPOSITORY}" 2>&1 | tee push.log
+          digest=$(sed -n 's/^Digest: //p' push.log)
+          chart_ref="oci://${OCI_REPOSITORY}/${NAME}:${VERSION}"
+          {
+            echo "chart-ref=${chart_ref}"
+            echo "digest=${digest}"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Published \`${NAME}\` ${VERSION}"
+            echo
+            echo "- Reference: \`${chart_ref}\`"
+            echo "- Digest: \`${digest}\`"
+            echo
+            echo '```yaml'
+            echo "dependencies:"
+            echo "  - name: ${NAME}"
+            echo "    version: \"${VERSION}\""
+            echo "    repository: oci://${OCI_REPOSITORY}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
