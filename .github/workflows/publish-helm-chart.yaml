@@ -1,8 +1,10 @@
 # Package a Helm chart and push it to an OCI registry on Google Artifact Registry.
 #
-# The chart version is derived from the triggering `<tag-prefix>X.Y.Z` git tag, or from the chart `appVersion`
-# (`<tag-prefix>X.Y.Z`) when not triggered by a tag. Callers need `permissions: id-token: write` and the target
-# repository must grant `roles/artifactregistry.writer` to the calling GitHub repository.
+# The chart version is derived from the triggering `<tag-prefix>X.Y.Z` git tag (push or release), or from the chart
+# `appVersion` (`<tag-prefix>X.Y.Z`) when not triggered by a tag. After the push, `version` and `appVersion` in
+# Chart.yaml are bumped on the default branch through a PR, as `publish-npm.yaml` does with package.json.
+# Callers need `permissions: id-token: write, contents: write, pull-requests: write` and the target repository must
+# grant `roles/artifactregistry.writer` to the calling GitHub repository.
 #
 # Example:
 #   jobs:
@@ -54,7 +56,15 @@ on:
         required: false
         type: string
         default: v3.17.3
+      default-branch:
+        description: Branch where the released version is recorded in Chart.yaml
+        required: false
+        type: string
+        default: main
     outputs:
+      version:
+        description: Version of the pushed chart
+        value: ${{ jobs.publish.outputs.version }}
       chart-ref:
         description: Fully qualified reference of the pushed chart (oci://<repository>/<name>:<version>)
         value: ${{ jobs.publish.outputs.chart-ref }}
@@ -68,6 +78,9 @@ permissions:
   contents: read
   id-token: write
 
+env:
+  TAG_PREFIX: ${{ inputs.tag-prefix }}
+
 jobs:
   publish:
     name: Package and push Helm chart
@@ -80,6 +93,8 @@ jobs:
     outputs:
       chart-ref: ${{ steps.push.outputs.chart-ref }}
       digest: ${{ steps.push.outputs.digest }}
+      version: ${{ steps.version.outputs.version }}
+      app-version: ${{ steps.version.outputs.app-version }}
 
     steps:
       - uses: actions/checkout@v7
@@ -108,7 +123,6 @@ jobs:
         id: version
         env:
           CHART_PATH: ${{ inputs.chart-path }}
-          TAG_PREFIX: ${{ inputs.tag-prefix }}
           INPUT_CHART_VERSION: ${{ inputs.chart-version }}
           INPUT_APP_VERSION: ${{ inputs.app-version }}
           REF_TYPE: ${{ github.ref_type }}
@@ -117,9 +131,13 @@ jobs:
           name=$(yq '.name' "${CHART_PATH}/Chart.yaml")
           chart_app_version=$(yq '.appVersion' "${CHART_PATH}/Chart.yaml")
 
-          if [ "${REF_TYPE}" = "tag" ] && [ "${REF_NAME}" != "${chart_app_version}" ]; then
-            echo "::error::Tag ${REF_NAME} does not match the appVersion ${chart_app_version} in ${CHART_PATH}/Chart.yaml"
-            exit 1
+          # the tag wins over Chart.yaml, which is bumped on the default branch after the push
+          if [ "${REF_TYPE}" = "tag" ]; then
+            if [[ "${REF_NAME}" != "${TAG_PREFIX}"* ]]; then
+              echo "::error::Tag ${REF_NAME} does not start with ${TAG_PREFIX}"
+              exit 1
+            fi
+            chart_app_version=${REF_NAME}
           fi
 
           app_version=${INPUT_APP_VERSION:-$chart_app_version}
@@ -186,3 +204,104 @@ jobs:
             echo "    repository: oci://${OCI_REPOSITORY}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Separate job: a failure here doesn't affect the pushed chart and can be re-run alone.
+  sync-version:
+    name: Record the released version
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEFAULT_BRANCH: ${{ inputs.default-branch }}
+      CHART_FILE: ${{ inputs.chart-path }}/Chart.yaml
+      VERSION: ${{ needs.publish.outputs.version }}
+      APP_VERSION: ${{ needs.publish.outputs.app-version }}
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.default-branch }}
+
+      # Only moves forward: skips prereleases and versions not newer than the one in Chart.yaml.
+      - name: Decide whether the version needs the bump
+        id: bump
+        run: |
+          CURRENT="$(yq '.version' "${CHART_FILE}")"
+          NAME="$(yq '.name' "${CHART_FILE}")"
+          echo "NAME=${NAME}" >> "${GITHUB_ENV}"
+          core() { local v="${1%%[-+]*}"; echo "${v//./ }"; }
+          newer() {
+            local -a r c
+            read -ra r <<< "$(core "$1")"
+            read -ra c <<< "$(core "$2")"
+            for i in 0 1 2; do
+              [ "${r[i]}" -ne "${c[i]}" ] && { [ "${r[i]}" -gt "${c[i]}" ]; return; }
+            done
+            [[ "$2" == *-* ]]
+          }
+          if [[ "${VERSION}" == *-* ]]; then
+            echo "::notice::${VERSION} is a prerelease, leaving ${DEFAULT_BRANCH} at ${CURRENT}"
+          elif newer "${VERSION}" "${CURRENT}"; then
+            echo "needed=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "::notice::${DEFAULT_BRANCH} is already at ${CURRENT}, not moving it to ${VERSION}"
+          fi
+
+      # sed rather than yq, to keep the comments and formatting of Chart.yaml
+      - name: Set version
+        if: steps.bump.outputs.needed == 'true'
+        run: |
+          sed -i -E \
+            -e "s#^version:.*#version: ${VERSION}#" \
+            -e "s#^appVersion:.*#appVersion: \"${APP_VERSION}\"#" \
+            "${CHART_FILE}"
+          if [ "$(yq '.version' "${CHART_FILE}")" != "${VERSION}" ] || [ "$(yq '.appVersion' "${CHART_FILE}")" != "${APP_VERSION}" ]; then
+            echo "::error::Could not set version ${VERSION} and appVersion ${APP_VERSION} in ${CHART_FILE}"
+            exit 1
+          fi
+
+      # Org rulesets require a PR and an `ECC-` branch prefix.
+      - name: Commit version bump
+        if: steps.bump.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BUMP_BRANCH="ECC-publish-bump-${TAG_PREFIX}${VERSION}"
+          gh pr list --state open --head "${BUMP_BRANCH}" --json number --jq '.[0].number' \
+            | xargs -r -I{} gh pr close {} --delete-branch
+          git push origin --delete "${BUMP_BRANCH}" 2>/dev/null || true
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "${BUMP_BRANCH}"
+          git add "${CHART_FILE}"
+          git commit -m "chore: bump ${NAME} chart to ${VERSION}"
+          git push origin "${BUMP_BRANCH}"
+          echo "BUMP_BRANCH=${BUMP_BRANCH}" >> "${GITHUB_ENV}"
+
+      # Doesn't fail where Actions can't open PRs or approvals are required: the bump is left
+      # for a maintainer to open or merge.
+      - name: Open and merge version bump PR
+        if: steps.bump.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! PR_URL="$(gh pr create \
+            --base "${DEFAULT_BRANCH}" \
+            --head "${BUMP_BRANCH}" \
+            --title "chore: bump ${NAME} chart to ${VERSION}" \
+            --body "Automated version bump after publishing chart ${NAME} ${VERSION}.")"; then
+            COMPARE_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${DEFAULT_BRANCH}...${BUMP_BRANCH}?expand=1"
+            echo "::warning::Could not open the version bump PR, open it from ${COMPARE_URL}"
+            echo "Version bump to open and merge: [${BUMP_BRANCH}](${COMPARE_URL})" >> "${GITHUB_STEP_SUMMARY}"
+          elif ! gh pr merge "${PR_URL}" --squash --delete-branch \
+            --subject "chore: bump ${NAME} chart to ${VERSION} [skip ci]"; then
+            echo "::warning::Could not merge the version bump PR, it needs approval: ${PR_URL}"
+            echo "Version bump PR to approve and merge: ${PR_URL}" >> "${GITHUB_STEP_SUMMARY}"
+          fi
