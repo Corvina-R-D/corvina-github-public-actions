@@ -47,7 +47,7 @@ on:
         type: string
         default: main
       tag-prefix:
-        description: Prefix of the release tag before the version, e.g. `my-lib-` for `my-lib-v1.2.3`, to release packages of one repo separately
+        description: Prefix of the release tag before the version, e.g. `my-lib-` for `my-lib-1.2.3`, to release packages of one repo separately
         type: string
         default: ""
 
